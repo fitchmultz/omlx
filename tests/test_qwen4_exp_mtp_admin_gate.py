@@ -10,9 +10,8 @@ is the runtime gate for the *generic* text-model patch.
 Both admin gates reused that whitelist, so the Lightning MTP toggle reported
 "model_type='qwen4_exp' is not on the MTP whitelist" and saving the setting
 returned 400 even though the runtime supports the head as shipped by the
-#3174 converter. The admin gates must instead accept qwen4_exp and fall
-through to the embedded ``mtp.*`` weight check — the same condition the
-runtime path applies.
+#3174 converter. The admin gates must instead accept qwen4_exp and check for
+embedded ``mtp.*`` weights or a matching standalone head, as the runtime does.
 """
 
 import json
