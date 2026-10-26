@@ -206,8 +206,10 @@ def qwen4_checkpoint(tmp_path):
     configure_mtp_runtime(tmp_path, enabled=False)
     configure_ple_runtime(tmp_path, mode="resident")
 
-    def write(*, layout="sidecar", centered=True, quantized=True):
+    def write(*, layout="sidecar", centered=True, head_centered=None, quantized=True):
         # Eight base anchors exercise the checkpoint-wide centering decision.
+        if head_centered is None:
+            head_centered = centered
         config.text_config.num_hidden_layers = 8
         config.text_config.layer_types *= 4
         config.quantization = {"group_size": 32, "bits": 4} if quantized else None
@@ -237,7 +239,7 @@ def qwen4_checkpoint(tmp_path):
             if isinstance(module, Qwen4ExpRMSNorm):
                 # Deliberately not near zero: MTP norms cannot decide centering.
                 head_weights[path + ".weight"] = mx.full(
-                    module.weight.shape, 1.25 + centered, dtype=mx.bfloat16
+                    module.weight.shape, -0.75 + head_centered, dtype=mx.bfloat16
                 )
         checkpoint_config = asdict(config)
         if not quantized:
@@ -249,14 +251,13 @@ def qwen4_checkpoint(tmp_path):
         if layout in ("sidecar", "both"):
             sidecar_dir = tmp_path / "mtp"
             sidecar_dir.mkdir()
-            (sidecar_dir / "config.json").write_text(
-                json.dumps(
-                    {
-                        "model_type": "qwen4_exp_mtp",
-                        "text_config": asdict(config.text_config),
-                    }
-                )
-            )
+            sidecar_config = {
+                "model_type": "qwen4_exp_mtp",
+                "text_config": asdict(config.text_config),
+            }
+            if head_centered:
+                sidecar_config["rms_norm_weight_format"] = "ones_centered"
+            (sidecar_dir / "config.json").write_text(json.dumps(sidecar_config))
             sidecar_weights = (
                 {key: value + 3 for key, value in head_weights.items()}
                 if layout == "both"
@@ -363,14 +364,148 @@ def test_qwen4_mtp_checkpoint_loads_values_and_precision(
     assert original_files == {p: p.read_bytes() for p in path.rglob("*") if p.is_file()}
 
 
+@pytest.mark.parametrize(
+    ("centered", "head_centered", "explicit_zero"),
+    [(True, False, False), (True, False, True), (False, True, False)],
+)
+def test_qwen4_sidecar_uses_its_own_norm_convention(
+    qwen4_checkpoint, centered, head_centered, explicit_zero
+):
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNorm
+
+    path, head_weights = qwen4_checkpoint(
+        centered=centered, head_centered=head_centered
+    )
+    if explicit_zero:
+        config_path = path / "mtp" / "config.json"
+        config = json.loads(config_path.read_text())
+        config["rms_norm_weight_format"] = "zero_centered"
+        config_path.write_text(json.dumps(config))
+
+    model = _load_qwen4_checkpoint(path)
+
+    for name, module in model.mtp.named_modules():
+        if isinstance(module, Qwen4ExpRMSNorm):
+            expected = head_weights[name + ".weight"].astype(mx.float32)
+            if not head_centered:
+                expected = expected + 1.0
+            assert mx.array_equal(
+                1.0 + module.weight.astype(mx.float32), expected
+            ).item()
+
+
+def test_qwen4_direct_gamma_sidecar_keeps_nonrepresentable_norms(qwen4_checkpoint):
+    path, head_weights = qwen4_checkpoint(centered=False, head_centered=True)
+    head_weights["pre_fc_norm_embedding.weight"] = mx.full(
+        head_weights["pre_fc_norm_embedding.weight"].shape,
+        0.2001953125,
+        dtype=mx.bfloat16,
+    )
+    mx.save_safetensors(str(path / "mtp" / "model.safetensors"), head_weights)
+
+    model = _load_qwen4_checkpoint(path)
+
+    weight = model.mtp.pre_fc_norm_embedding.weight
+    assert weight.dtype == mx.float32
+    assert mx.array_equal(
+        1.0 + weight, head_weights["pre_fc_norm_embedding.weight"].astype(mx.float32)
+    ).item()
+
+
+@pytest.mark.parametrize("prefix", ["mtp.", "model.language_model.mtp."])
+def test_qwen4_sidecar_loads_checkpoint_prefixed_head(qwen4_checkpoint, prefix):
+    path, head_weights = qwen4_checkpoint(centered=False)
+    mx.save_safetensors(
+        str(path / "mtp" / "model.safetensors"),
+        {prefix + key: value for key, value in head_weights.items()},
+    )
+
+    model = _load_qwen4_checkpoint(path)
+
+    assert mx.array_equal(
+        model.mtp.fc_hidden.weight, head_weights["fc_hidden.weight"]
+    ).item()
+
+
+def test_qwen4_sidecar_rejects_colliding_weight_names(qwen4_checkpoint):
+    path, head_weights = qwen4_checkpoint(centered=False)
+    head_weights["mtp.fc_hidden.weight"] = head_weights["fc_hidden.weight"]
+    mx.save_safetensors(str(path / "mtp" / "model.safetensors"), head_weights)
+
+    with pytest.raises(ValueError, match="duplicate.*mtp.fc_hidden.weight"):
+        _load_qwen4_checkpoint(path)
+
+
+def test_qwen4_dense_sidecar_ignores_target_head_quantization_override(
+    qwen4_checkpoint,
+):
+    import mlx.nn as nn
+
+    path, head_weights = qwen4_checkpoint(centered=False)
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"]["mtp.fc_hidden"] = {"group_size": 32, "bits": 4}
+    config_path.write_text(json.dumps(config))
+
+    model = _load_qwen4_checkpoint(path)
+
+    assert isinstance(model.language_model.model.embed_tokens, nn.QuantizedEmbedding)
+    assert isinstance(model.mtp.fc_hidden, nn.Linear)
+    assert mx.array_equal(
+        model.mtp.fc_hidden.weight, head_weights["fc_hidden.weight"]
+    ).item()
+
+
+@pytest.mark.parametrize("layout", ["embedded", "sidecar"])
+def test_qwen4_quantized_head_honors_target_quantization_override(
+    qwen4_checkpoint, layout
+):
+    import mlx.nn as nn
+
+    path, _ = qwen4_checkpoint(layout=layout, centered=False)
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"]["mtp.fc_hidden"] = {"group_size": 32, "bits": 4}
+    config_path.write_text(json.dumps(config))
+    weight_path = path / (
+        "mtp/model.safetensors" if layout == "sidecar" else "model.safetensors"
+    )
+    prefix = "" if layout == "sidecar" else "mtp."
+    weights = mx.load(str(weight_path))
+    weight, scales, biases = mx.quantize(
+        weights[prefix + "fc_hidden.weight"], group_size=32, bits=4
+    )
+    weights.update(
+        {
+            prefix + "fc_hidden.weight": weight,
+            prefix + "fc_hidden.scales": scales,
+            prefix + "fc_hidden.biases": biases,
+        }
+    )
+    mx.save_safetensors(str(weight_path), weights, metadata={"format": "mlx"})
+
+    model = _load_qwen4_checkpoint(path)
+
+    assert isinstance(model.mtp.fc_hidden, nn.QuantizedLinear)
+    assert model.mtp.fc_hidden.bits == 4
+    assert mx.array_equal(model.mtp.fc_hidden.weight, weight).item()
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("layout", ["sidecar", "embedded"])
+@pytest.mark.parametrize("layout", ["sidecar", "prefixed_sidecar", "embedded"])
 async def test_qwen4_quantization_advertises_only_preservable_heads(
     qwen4_checkpoint, monkeypatch, layout
 ):
     from omlx.admin.oq_manager import OQManager
 
-    path, _ = qwen4_checkpoint(layout=layout, quantized=False)
+    path, head_weights = qwen4_checkpoint(
+        layout="sidecar" if layout == "prefixed_sidecar" else layout, quantized=False
+    )
+    if layout == "prefixed_sidecar":
+        mx.save_safetensors(
+            str(path / "mtp" / "model.safetensors"),
+            {"mtp." + key: value for key, value in head_weights.items()},
+        )
     manager = OQManager(model_dirs=[str(path.parent)])
     sources, _ = await manager.list_quantizable_models()
     source = next(model for model in sources if model["path"] == str(path))
@@ -430,7 +565,8 @@ def test_qwen4_mtp_sidecar_keeps_strict_weight_validation(qwen4_checkpoint, dama
 
 
 @pytest.mark.parametrize(
-    "damage", ["model_type", "text_config", "unreadable", "prefixed_mismatch"]
+    "damage",
+    ["model_type", "text_config", "unreadable", "prefixed_mismatch", "norm_format"],
 )
 def test_qwen4_mtp_rejects_incompatible_sidecar(qwen4_checkpoint, damage):
     from omlx.admin.routes import _mtp_compat_for_model
@@ -444,6 +580,8 @@ def test_qwen4_mtp_rejects_incompatible_sidecar(qwen4_checkpoint, damage):
     else:
         if damage in ("model_type", "prefixed_mismatch"):
             config["model_type"] = "other_mtp"
+        elif damage == "norm_format":
+            config["rms_norm_weight_format"] = "unrecognized"
         else:
             config["text_config"]["hidden_size"] *= 2
         config_path.write_text(json.dumps(config))

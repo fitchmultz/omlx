@@ -1352,6 +1352,15 @@ def _checkpoint_qwen4_mtp_sidecar(model_path: str | Path) -> Path | None:
             or mtp_config.get("text_config") != config["text_config"]
         ):
             return None
+        norm_format = mtp_config.get("rms_norm_weight_format", "zero_centered")
+        if norm_format not in ("zero_centered", "ones_centered"):
+            logger.warning(
+                "Ignoring Qwen4 MTP sidecar %s: invalid rms_norm_weight_format %r; "
+                "use zero_centered or ones_centered",
+                sidecar.parent,
+                norm_format,
+            )
+            return None
         import safetensors
 
         with safetensors.safe_open(str(sidecar), framework="numpy") as f:
@@ -1371,12 +1380,12 @@ def _checkpoint_has_qwen4_mtp_weights(model_path: str | Path) -> bool:
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
-    """True iff the checkpoint at *model_path* ships any MTP weight tensor.
+    """Whether a checkpoint exposes MTP weights to generic loaders and oQ.
 
     Matches both the ``mtp.*`` naming and compatible nextn layouts (extra
     decoder layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
-    Qwen4-Exp is intentionally restricted to ``mtp.*`` because its dedicated
-    runtime cannot bind native nextn layers.
+    Qwen4-Exp only uses embedded ``mtp.*`` here: its standalone heads are
+    handled by the dedicated runtime but cannot yet be preserved by oQ.
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -1393,6 +1402,8 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
     if _checkpoint_weight_prefix(model_path, prefixes) is not None:
         return True
+    if _config_model_type(model_path) == "qwen4_exp":
+        return False
     return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 
