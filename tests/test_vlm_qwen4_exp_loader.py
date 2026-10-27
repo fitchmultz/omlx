@@ -535,7 +535,13 @@ def test_qwen4_nested_embedded_shard_is_loaded_and_available_to_oq(qwen4_checkpo
     ).item()
 
 
-def test_qwen4_embedded_mtp_directory_is_not_a_standalone_head(qwen4_checkpoint):
+@pytest.mark.parametrize(
+    "config",
+    [{"model_type": "qwen4_exp"}, {"model_type": "other"}, {"note": "metadata"}],
+)
+def test_qwen4_embedded_mtp_directory_is_not_a_standalone_head(
+    qwen4_checkpoint, config
+):
     path, head_weights = qwen4_checkpoint(layout="embedded", centered=False)
     root_path = path / "model.safetensors"
     root = mx.load(str(root_path))
@@ -544,7 +550,7 @@ def test_qwen4_embedded_mtp_directory_is_not_a_standalone_head(qwen4_checkpoint)
     mx.save_safetensors(str(root_path), root, metadata={"format": "mlx"})
     nested = path / "mtp"
     nested.mkdir()
-    (nested / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (nested / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(nested / "model.safetensors"), embedded)
     index = {
         "weight_map": {
@@ -832,6 +838,8 @@ def test_qwen4_mtp_sidecar_keeps_strict_weight_validation(qwen4_checkpoint, dama
         "norm_format",
         "indexed_norm_format",
         "indexed_text_config",
+        "indexed_model_type",
+        "indexed_foreign_model",
     ],
 )
 def test_qwen4_mtp_rejects_incompatible_sidecar(qwen4_checkpoint, damage):
@@ -844,8 +852,15 @@ def test_qwen4_mtp_rejects_incompatible_sidecar(qwen4_checkpoint, damage):
     if damage == "unreadable":
         config_path.write_text("{")
     else:
-        if damage in ("model_type", "prefixed_mismatch"):
-            config["model_type"] = "other_mtp"
+        if damage in (
+            "model_type",
+            "prefixed_mismatch",
+            "indexed_model_type",
+            "indexed_foreign_model",
+        ):
+            config["model_type"] = (
+                "other" if damage == "indexed_foreign_model" else "other_mtp"
+            )
         elif damage in ("norm_format", "indexed_norm_format"):
             config["rms_norm_weight_format"] = "unrecognized"
         else:

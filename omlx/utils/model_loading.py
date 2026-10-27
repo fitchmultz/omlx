@@ -1368,7 +1368,15 @@ def _qwen4_mtp_sidecar_candidate(model_path: str | Path) -> Path | None:
         return None
     try:
         config = json.loads((sidecar.parent / "config.json").read_text())
-        if config.get("model_type") == "qwen4_exp_mtp":
+        model_type = config.get("model_type")
+        # A declared but incompatible drafter is not an embedded target shard.
+        # Unrelated metadata beside a genuine shard does not establish a head.
+        if isinstance(model_type, str) and model_type != "qwen4_exp" and (
+            model_type == "mtp"
+            or model_type.startswith("mtp_")
+            or model_type.endswith("_mtp")
+            or isinstance(config.get("text_config"), dict)
+        ):
             return sidecar
     except (ValueError, OSError, AttributeError):
         pass
