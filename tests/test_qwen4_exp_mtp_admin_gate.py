@@ -38,6 +38,9 @@ def _make_checkpoint(
     name="Qwen3.8-Flash-Next",
     nextn_weights=False,
 ):
+    import numpy as np
+    from safetensors.numpy import save_file
+
     model_dir = tmp_path / name
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps(config))
@@ -48,6 +51,10 @@ def _make_checkpoint(
         weight_map["model.layers.48.self_attn.q_proj.weight"] = "model.safetensors"
     (model_dir / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+    save_file(
+        {key: np.zeros((1,), dtype=np.float32) for key in weight_map},
+        str(model_dir / "model.safetensors"),
     )
     return model_dir
 

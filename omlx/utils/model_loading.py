@@ -1309,7 +1309,15 @@ def _checkpoint_weight_prefix(
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
-    shards = sorted(p.glob("*.safetensors"))
+    return _checkpoint_weight_prefix_in_shards(
+        sorted(p.glob("*.safetensors")), prefixes
+    )
+
+
+def _checkpoint_weight_prefix_in_shards(
+    shards: list[Path], prefixes: tuple[str, ...]
+) -> str | None:
+    """Inspect physical shard headers without loading their tensor data."""
     if not shards:
         return None
     try:
@@ -1330,9 +1338,58 @@ def _checkpoint_weight_prefix(
     return None
 
 
+def _qwen4_checkpoint_shards(model_path: str | Path) -> list[Path]:
+    """Select physical files using the same index/fallback rule as mlx-vlm."""
+    model_path = Path(model_path)
+    index = model_path / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map", {})
+            shards = [
+                model_path / name
+                for name in sorted(set(weight_map.values()))
+                if (model_path / name).exists()
+            ]
+            if shards:
+                return shards
+        except (ValueError, OSError):
+            pass
+    return sorted(
+        path
+        for path in model_path.glob("*.safetensors")
+        if path.name != "consolidated.safetensors"
+    )
+
+
+def _qwen4_mtp_sidecar_candidate(model_path: str | Path) -> Path | None:
+    """Identify a declared standalone head even if other metadata is invalid."""
+    sidecar = Path(model_path) / "mtp" / "model.safetensors"
+    if not sidecar.is_file():
+        return None
+    try:
+        config = json.loads((sidecar.parent / "config.json").read_text())
+        if config.get("model_type") == "qwen4_exp_mtp":
+            return sidecar
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def _qwen4_embedded_shards(model_path: str | Path) -> list[Path]:
+    """Exclude an independently configured head from mlx-vlm's shard set."""
+    sidecar = _qwen4_mtp_sidecar_candidate(model_path)
+    return [
+        shard
+        for shard in _qwen4_checkpoint_shards(model_path)
+        if sidecar is None or shard.resolve() != sidecar.resolve()
+    ]
+
+
 def _checkpoint_qwen4_mtp_weight_prefix(model_path: str | Path) -> str | None:
     """Return the embedded MTP prefix supported by the Qwen4 runtime."""
-    return _checkpoint_weight_prefix(model_path, _MTP_WEIGHT_PREFIXES)
+    return _checkpoint_weight_prefix_in_shards(
+        _qwen4_embedded_shards(model_path), _MTP_WEIGHT_PREFIXES
+    )
 
 
 def _checkpoint_qwen4_mtp_sidecar(model_path: str | Path) -> Path | None:
@@ -1399,11 +1456,13 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     ``mtp/model_mtp.safetensors`` sidecar. If neither contains MTP weights,
     callers skip attaching the MTP module.
     """
+    if _config_model_type(model_path) == "qwen4_exp":
+        return _checkpoint_weight_prefix_in_shards(
+            _qwen4_embedded_shards(model_path), _MTP_WEIGHT_PREFIXES
+        ) is not None
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
     if _checkpoint_weight_prefix(model_path, prefixes) is not None:
         return True
-    if _config_model_type(model_path) == "qwen4_exp":
-        return False
     return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 

@@ -140,20 +140,20 @@ def configure_mtp_runtime(
     """Detect and bind an embedded or standalone Qwen4 Lightning MTP head."""
     global _MTP_RUNTIME
 
-    checkpoint_prefix = None
-    sidecar_path = None
-    if enabled:
-        from omlx.utils.model_loading import (
-            _checkpoint_qwen4_mtp_sidecar,
-            _checkpoint_qwen4_mtp_weight_prefix,
-        )
+    from omlx.utils.model_loading import (
+        _checkpoint_qwen4_mtp_sidecar,
+        _checkpoint_qwen4_mtp_weight_prefix,
+        _qwen4_mtp_sidecar_candidate,
+    )
 
+    checkpoint_prefix = None
+    sidecar_path = _qwen4_mtp_sidecar_candidate(model_path)
+    compatible_sidecar = _checkpoint_qwen4_mtp_sidecar(model_path)
+    if enabled:
         checkpoint_prefix = _checkpoint_qwen4_mtp_weight_prefix(model_path)
-        if checkpoint_prefix is None:
-            sidecar_path = _checkpoint_qwen4_mtp_sidecar(model_path)
 
     _MTP_RUNTIME = Qwen4ExpMTPRuntime(
-        enabled=bool(enabled and (checkpoint_prefix or sidecar_path)),
+        enabled=bool(enabled and (checkpoint_prefix or compatible_sidecar)),
         checkpoint_prefix=checkpoint_prefix,
         sidecar_path=sidecar_path,
     )

@@ -103,14 +103,14 @@ Run `python -m pytest -q tests/test_vlm_qwen4_exp_loader.py` for Qwen4 loading.
 The synthetic checkpoint cases run on CPU and cover embedded heads and standalone
 `mtp/model.safetensors` heads with `mtp/config.json` declaring
 `model_type=qwen4_exp_mtp` and the same `text_config` as the target. They verify
-loaded values, independent RMSNorm conventions for target and sidecar, a dense
-BF16 head alongside a 4-bit target with per-module overrides, prefixed head
-tensors, embedded precedence, MTP-off behavior, incompatible sidecars and strict
-missing/unexpected/shape errors. Native sidecars use zero-centered norms; a
-legacy direct-gamma sidecar can declare `rms_norm_weight_format=ones_centered`
-in its config. No checkpoint assets are downloaded or rewritten. The same
-fixtures check conservative discovery/residency accounting, admin toggles, and
-that oQ does not advertise preservation of standalone Qwen4 heads.
+loaded values, independent RMSNorm conventions for target and sidecar, native
+MLX quantization recipes, prefixed and indexed heads, embedded precedence,
+MTP-off behavior, incompatible sidecars and strict missing/unexpected/shape
+errors. Native sidecars use zero-centered norms; a legacy direct-gamma sidecar
+can declare `rms_norm_weight_format=ones_centered` in its config. No checkpoint
+assets are downloaded or rewritten. The same fixtures check conservative
+discovery/residency accounting, admin toggles, indexed embedded shards in oQ,
+and that oQ does not advertise preservation of standalone Qwen4 heads.
 
 # Prefill memory accounting tests
 
